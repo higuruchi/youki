@@ -1,8 +1,19 @@
+use crate::syscall::linux;
 use anyhow::{anyhow, Result};
 use nix::{mount::MsFlags, sys::stat::SFlag, NixPath};
 use oci_spec::runtime::{LinuxDevice, LinuxDeviceBuilder, LinuxDeviceType, Mount};
 use procfs::process::MountInfo;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone)]
+pub struct MountOptionConfig {
+    // Mount Flags.
+    pub flags: MsFlags,
+    // Mount data applied to the mount.
+    pub data: String,
+    // RecAttr represents mount properties to be applied recrusively.
+    pub rec_attr: Option<linux::MountAttr>,
+}
 
 pub fn default_devices() -> Vec<LinuxDevice> {
     vec![
@@ -66,9 +77,11 @@ pub fn to_sflag(dev_type: LinuxDeviceType) -> SFlag {
     }
 }
 
-pub fn parse_mount(m: &Mount) -> (MsFlags, String) {
+pub fn parse_mount(m: &Mount) -> MountOptionConfig {
     let mut flags = MsFlags::empty();
     let mut data = Vec::new();
+    let mut mount_attr: Option<linux::MountAttr> = None;
+
     if let Some(options) = &m.options() {
         for s in options {
             if let Some((is_clear, flag)) = match s.as_str() {
@@ -112,12 +125,62 @@ pub fn parse_mount(m: &Mount) -> (MsFlags, String) {
                 } else {
                     flags |= flag;
                 }
-            } else {
-                data.push(s.as_str());
-            };
+                continue;
+            }
+
+            if let Some((is_clear, flag)) = match s.as_str() {
+                "rro" => Some((false, linux::MOUNT_ATTR_RDONLY)),
+                "rrw" => Some((true, linux::MOUNT_ATTR_RDONLY)),
+                "rnosuid" => Some((false, linux::MOUNT_ATTR_NOSUID)),
+                "rsuid" => Some((true, linux::MOUNT_ATTR_NOSUID)),
+                "rnodev" => Some((false, linux::MOUNT_ATTR_NODEV)),
+                "rdev" => Some((true, linux::MOUNT_ATTR_NODEV)),
+                "rnoexec" => Some((false, linux::MOUNT_ATTR_NOEXEC)),
+                "rexec" => Some((true, linux::MOUNT_ATTR_NOEXEC)),
+                "rnodiratime" => Some((false, linux::MOUNT_ATTR_NODIRATIME)),
+                "rdiratime" => Some((true, linux::MOUNT_ATTR_NODIRATIME)),
+                "rrelatime" => Some((false, linux::MOUNT_ATTR_RELATIME)),
+                "rnorelatime" => Some((true, linux::MOUNT_ATTR_RELATIME)),
+                "rnoatime" => Some((false, linux::MOUNT_ATTR_NOATIME)),
+                "ratime" => Some((true, linux::MOUNT_ATTR_NOATIME)),
+                "rstrictatime" => Some((false, linux::MOUNT_ATTR_STRICTATIME)),
+                "rnostrictatime" => Some((true, linux::MOUNT_ATTR_STRICTATIME)),
+                "rnosymfollow" => Some((false, linux::MOUNT_ATTR_NOSYMFOLLOW)),
+                "rsymfollow" => Some((true, linux::MOUNT_ATTR_NOSYMFOLLOW)),
+                // No support for MOUNT_ATTR_IDMAP yet (needs UserNS FD)
+                _ => None,
+            } {
+                if let None = mount_attr {
+                    mount_attr = Some(linux::MountAttr {
+                        attr_set: 0,
+                        attr_clr: 0,
+                        propagation: 0,
+                        userns_fd: 0,
+                    });
+                }
+
+                if let Some(mount_attr) = &mut mount_attr {
+                    if is_clear {
+                        mount_attr.attr_clr |= flag;
+                    } else {
+                        mount_attr.attr_set |= flag;
+                        if flag & linux::MOUNT_ATTR__ATIME == flag {
+                            mount_attr.attr_clr |= linux::MOUNT_ATTR__ATIME;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            data.push(s.as_str());
         }
     }
-    (flags, data.join(","))
+
+    MountOptionConfig {
+        flags: flags,
+        data: data.join(","),
+        rec_attr: mount_attr,
+    }
 }
 
 /// Find parent mount of rootfs in given mount infos

@@ -1,10 +1,10 @@
 use super::{
     symlink::Symlink,
-    utils::{find_parent_mount, parse_mount},
+    utils::{find_parent_mount, parse_mount, MountOptionConfig},
 };
 use crate::utils::PathBufExt;
 use crate::{
-    syscall::{syscall::create_syscall, Syscall},
+    syscall::{linux, syscall::create_syscall, Syscall},
     utils,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::{
     collections::HashMap,
     fs::{canonicalize, create_dir_all, OpenOptions},
+    mem,
+    os::unix::io::AsRawFd,
 };
 
 #[derive(Debug)]
@@ -48,7 +50,7 @@ impl Mount {
 
     pub fn setup_mount(&self, mount: &SpecMount, options: &MountOptions) -> Result<()> {
         log::debug!("Mounting {:?}", mount);
-        let (flags, data) = parse_mount(mount);
+        let mut mount_option_config = parse_mount(mount);
 
         match mount.typ().as_deref() {
             Some("cgroup") => {
@@ -59,29 +61,35 @@ impl Mount {
                         .mount_cgroup_v1(mount, options)
                         .context("failed to mount cgroup v1")?,
                     Unified => self
-                        .mount_cgroup_v2(mount, options, flags, &data)
+                        .mount_cgroup_v2(mount, options, &mount_option_config)
                         .context("failed to mount cgroup v2")?,
                 }
             }
             _ => {
                 if *mount.destination() == PathBuf::from("/dev") {
+                    mount_option_config.flags = mount_option_config.flags & !MsFlags::MS_RDONLY;
                     self.mount_into_container(
                         mount,
                         options.root,
-                        flags & !MsFlags::MS_RDONLY,
-                        &data,
+                        &mount_option_config,
                         options.label,
                     )
                     .with_context(|| format!("failed to mount /dev: {:?}", mount))?;
                 } else {
-                    self.mount_into_container(mount, options.root, flags, &data, options.label)
-                        .with_context(|| format!("failed to mount: {:?}", mount))?;
+                    self.mount_into_container(
+                        mount,
+                        options.root,
+                        &mount_option_config,
+                        options.label,
+                    )
+                    .with_context(|| format!("failed to mount: {:?}", mount))?;
                 }
             }
         }
 
         Ok(())
     }
+
     fn mount_cgroup_v1(&self, cgroup_mount: &SpecMount, options: &MountOptions) -> Result<()> {
         log::debug!("Mounting cgroup v1 filesystem");
         // create tmpfs into which the cgroup subsystems will be mounted
@@ -188,11 +196,15 @@ impl Mount {
             subsystem_name.into()
         };
 
+        let mount_options_config = MountOptionConfig {
+            flags: MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            data: data.to_string(),
+            rec_attr: None,
+        };
         self.mount_into_container(
             &subsystem_mount,
             options.root,
-            MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-            &data,
+            &mount_options_config,
             options.label,
         )
         .with_context(|| format!("failed to mount {:?}", subsystem_mount))
@@ -260,8 +272,7 @@ impl Mount {
         &self,
         cgroup_mount: &SpecMount,
         options: &MountOptions,
-        flags: MsFlags,
-        data: &str,
+        mount_option_config: &MountOptionConfig,
     ) -> Result<()> {
         log::debug!("Mounting cgroup v2 filesystem");
 
@@ -274,7 +285,12 @@ impl Mount {
         log::debug!("{:?}", cgroup_mount);
 
         if self
-            .mount_into_container(&cgroup_mount, options.root, flags, data, options.label)
+            .mount_into_container(
+                &cgroup_mount,
+                options.root,
+                mount_option_config,
+                options.label,
+            )
             .context("failed to mount into container")
             .is_err()
         {
@@ -298,11 +314,12 @@ impl Mount {
                 .context("failed to build cgroup bind mount")?;
             log::debug!("{:?}", bind_mount);
 
+            let mut mount_option_config = (*mount_option_config).clone();
+            mount_option_config.flags |= MsFlags::MS_BIND;
             self.mount_into_container(
                 &bind_mount,
                 options.root,
-                flags | MsFlags::MS_BIND,
-                data,
+                &mount_option_config,
                 options.label,
             )
             .context("failed to bind mount cgroup hierarchy")?;
@@ -340,18 +357,17 @@ impl Mount {
         &self,
         m: &SpecMount,
         rootfs: &Path,
-        flags: MsFlags,
-        data: &str,
+        mount_option_config: &MountOptionConfig,
         label: Option<&str>,
     ) -> Result<()> {
         let typ = m.typ().as_deref();
-        let mut d = data.to_string();
+        let mut d = mount_option_config.data.to_string();
 
         if let Some(l) = label {
             if typ != Some("proc") && typ != Some("sysfs") {
-                match data.is_empty() {
+                match mount_option_config.data.is_empty() {
                     true => d = format!("context=\"{}\"", l),
-                    false => d = format!("{},context=\"{}\"", data, l),
+                    false => d = format!("{},context=\"{}\"", mount_option_config.data, l),
                 }
             }
         }
@@ -391,7 +407,10 @@ impl Mount {
             PathBuf::from(source)
         };
 
-        if let Err(err) = self.syscall.mount(Some(&*src), dest, typ, flags, Some(&*d)) {
+        if let Err(err) =
+            self.syscall
+                .mount(Some(&*src), dest, typ, mount_option_config.flags, Some(&*d))
+        {
             if let Some(errno) = err.downcast_ref() {
                 if !matches!(errno, Errno::EINVAL) {
                     bail!("mount of {:?} failed. {}", m.destination(), errno);
@@ -399,12 +418,18 @@ impl Mount {
             }
 
             self.syscall
-                .mount(Some(&*src), dest, typ, flags, Some(data))
+                .mount(
+                    Some(&*src),
+                    dest,
+                    typ,
+                    mount_option_config.flags,
+                    Some(&mount_option_config.data),
+                )
                 .with_context(|| format!("failed to mount {:?} to {:?}", src, dest))?;
         }
 
         if typ == Some("bind")
-            && flags.intersects(
+            && mount_option_config.flags.intersects(
                 !(MsFlags::MS_REC
                     | MsFlags::MS_REMOUNT
                     | MsFlags::MS_BIND
@@ -414,10 +439,26 @@ impl Mount {
             )
         {
             self.syscall
-                .mount(Some(dest), dest, None, flags | MsFlags::MS_REMOUNT, None)
+                .mount(
+                    Some(dest),
+                    dest,
+                    None,
+                    mount_option_config.flags | MsFlags::MS_REMOUNT,
+                    None,
+                )
                 .with_context(|| format!("Failed to remount: {:?}", dest))?;
         }
 
+        if let Some(mount_attr) = &mount_option_config.rec_attr {
+            let dfd = OpenOptions::new().read(true).open(dest)?;
+            self.syscall.mount_setattr(
+                dfd.as_raw_fd(),
+                Path::new(""),
+                linux::AT_RECURSIVE,
+                mount_attr,
+                mem::size_of::<linux::MountAttr>(),
+            )?;
+        }
         Ok(())
     }
 }
